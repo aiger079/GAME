@@ -1,66 +1,151 @@
-/* ===================== online play (PeerJS, host-authoritative) ===================== */
-const NET_VER = 1;
+/* ===================== online play (Supabase relay, host-authoritative) ===================== */
+const NET_VER = 2;
 const Net = {
   role: 'off', peer: null, conns: new Map(), hostConn: null, code: '', lobby: null, myId: 0, myTeam: 'auto',
   status: '', statusCls: '', connecting: false, statusText: '', evq: [], snapT: 0, inT: 0, pingT: 0, inN: 0,
   cGren: new Map(), cItems: new Map(), lastRound: 0,
+  relay: null, relayLoading: null, channel: null, clientId: '', clientReady: false, joinTimer: null,
   setStatus(t, cls) { this.status = t; this.statusCls = cls || ''; const s = $('#netStatus'); if (s) { s.textContent = t; s.className = 'status ' + (cls || ''); } },
   refresh() { if (Menu.pane === 'online' && !App.inGame && $('#mpane')) Menu.renderPane(); },
-  iceConfig() { return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }] }; },
-  makeCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < 5; i++) s += A[Math.floor(Math.random() * A.length)]; return s; },
-  available() { return typeof window.Peer === 'function'; },
+  makeCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', bytes = new Uint8Array(8); crypto.getRandomValues(bytes); return Array.from(bytes, b => A[b & 31]).join(''); },
+  makeClientId() { return crypto.randomUUID ? crypto.randomUUID() : Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''); },
+  available() { return typeof SUPABASE_GAME !== 'undefined' && !!SUPABASE_GAME.url && !!SUPABASE_GAME.key; },
+  async realtimeClient() {
+    if (this.relay) return this.relay;
+    if (!this.available()) throw new Error('The room relay is not configured. Reload the game and try again.');
+    if (!this.relayLoading) this.relayLoading = import('https://esm.sh/@supabase/supabase-js@2.118.0?bundle').then(m => {
+      this.relay = m.createClient(SUPABASE_GAME.url, SUPABASE_GAME.key, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } });
+      return this.relay;
+    }).catch(e => { this.relayLoading = null; throw new Error('Could not load the room relay. Check your internet connection and try again (' + (e.message || 'network error') + ').'); });
+    return this.relayLoading;
+  },
+  getRelayClient() {
+    let timer;
+    return Promise.race([this.realtimeClient(), new Promise((resolve, reject) => { timer = setTimeout(() => { this.relayLoading = null; reject(new Error('Loading the room relay timed out. Check your connection and try again.')); }, 15000); })]).finally(() => clearTimeout(timer));
+  },
+  openRoomChannel(code, presenceKey) {
+    const channel = this.relay.channel('cs2-room:' + code, { config: { private: false, broadcast: { self: false, ack: false }, presence: { key: presenceKey } } });
+    this.channel = channel;
+    channel.on('broadcast', { event: 'packet' }, message => this.onRelay(message && message.payload));
+    channel.on('presence', { event: 'sync' }, () => this.checkRoomHost());
+    channel.on('presence', { event: 'join' }, () => this.checkRoomHost());
+    channel.on('presence', { event: 'leave' }, message => {
+      if (this.role !== 'host') return;
+      for (const person of (message && message.leftPresences) || []) {
+        const conn = person && person.clientId && this.conns.get(person.clientId);
+        if (conn) this.dropPeer(conn);
+      }
+    });
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) { settled = true; reject(new Error('The room relay did not respond. Check your connection and retry.')); }
+      }, 15000);
+      channel.subscribe(status => {
+        if (this.channel !== channel) return;
+        if (status === 'SUBSCRIBED') {
+          clearTimeout(timer); settled = true; resolve(channel);
+        } else if (['CHANNEL_ERROR', 'TIMED_OUT', 'CLOSED'].includes(status)) {
+          const message = status === 'TIMED_OUT' ? 'The room relay timed out.' : 'The room relay could not open (' + status.toLowerCase() + ').';
+          if (!settled) { clearTimeout(timer); settled = true; reject(new Error(message)); }
+          else if (this.role === 'host') this.hostGone();
+          else if (this.role === 'client') this.hostGone();
+        }
+      });
+    });
+  },
+  makeRelayConn(peerId, target) {
+    const handlers = { data: [], close: [], error: [] };
+    return {
+      peer: peerId, open: true,
+      on(event, fn) { if (handlers[event]) handlers[event].push(fn); return this; },
+      deliver(data) { if (this.open) for (const fn of handlers.data.slice()) fn(data); },
+      send(data) {
+        const channel = Net.channel;
+        if (!this.open || !channel) return Promise.resolve({ status: 'error' });
+        const packet = { from: Net.role === 'host' ? 'host' : Net.clientId, to: target, data };
+        try { return channel.send({ type: 'broadcast', event: 'packet', payload: packet }); }
+        catch (e) { return Promise.reject(e); }
+      },
+      close() { if (!this.open) return; this.open = false; for (const fn of handlers.close.slice()) fn(); }
+    };
+  },
+  onRelay(packet) {
+    if (!this.channel || !packet || !packet.from || !packet.to || !packet.data) return;
+    if (this.role === 'host' && packet.to === 'host' && packet.from !== 'host') {
+      let conn = this.conns.get(packet.from);
+      if (!conn) {
+        if (packet.data.t !== 'hello') return;
+        conn = this.makeRelayConn(packet.from, packet.from); this.hostAccept(conn);
+      }
+      conn.deliver(packet.data);
+    } else if (this.role === 'client' && packet.from === 'host' && packet.to === this.clientId && this.hostConn) {
+      this.hostConn.deliver(packet.data);
+    }
+  },
+  checkRoomHost() {
+    if (this.role !== 'client' || this.clientReady || !this.channel) return;
+    const people = Object.values(this.channel.presenceState()).flat();
+    if (!people.some(p => p && p.role === 'host')) return;
+    this.clientReady = true;
+    this.hostConn = this.makeRelayConn('host', 'host');
+    this.hostConn.send({ t: 'hello', name: Settings.v.name, v: NET_VER, skins: Loadout.v.skins, ks: Loadout.v.knifeSkin, knife: Loadout.v.knife, team: this.myTeam });
+    this.statusText = 'Host found. Joining room ' + this.code + '…'; this.refresh();
+  },
 
   /* ---------- lobby ---------- */
-  host(retry) {
-    if (!this.available()) { this.setStatus('Online play needs the PeerJS library, which failed to load.', 'err'); return; }
+  async host() {
+    if (!this.available()) { this.setStatus('The room relay is not configured. Reload the game and try again.', 'err'); return; }
     this.leave(true);
     const code = this.makeCode();
-    this.connecting = true; this.statusText = 'Creating room…'; this.refresh();
-    let peer;
-    try { peer = new Peer('cs2x-' + code.toLowerCase(), { debug: 0, config: this.iceConfig() }); } catch (e) { this.fail('Could not start networking: ' + e.message); return; }
-    this.peer = peer;
-    peer.on('open', () => {
-      this.role = 'host'; this.connecting = false; this.code = code; this.myId = 1;
+    this.clientId = 'host-' + this.makeClientId();
+    this.connecting = true; this.statusText = 'Creating room on relay…'; this.refresh();
+    try {
+      this.relay = await this.getRelayClient();
+      if (!this.connecting) return;
+      const channel = await this.openRoomChannel(code, this.clientId);
+      if (!this.connecting) return;
+      this.role = 'host'; this.code = code; this.myId = 1;
       this.lobby = { players: [{ id: 1, name: Settings.v.name, team: this.myTeam, host: true }], cfg: { mode: Settings.v.mode, diff: Settings.v.difficulty } };
-      this.setStatus('Room ready. Share the code with your friends.', 'ok'); this.refresh();
-    });
-    peer.on('connection', conn => this.hostAccept(conn));
-    peer.on('error', err => {
-      if (err.type === 'unavailable-id' && !retry) { this.host(true); return; }
-      if (this.role === 'host' && err.type !== 'peer-unavailable') { this.setStatus('Network: ' + err.type, 'err'); return; }
-      this.fail('Could not create the room (' + (err.type || err.message) + '). Check your internet connection.');
-    });
-    peer.on('disconnected', () => { if (this.role === 'host') { try { peer.reconnect(); } catch (e) { } } });
+      const presence = await channel.track({ role: 'host', clientId: this.clientId });
+      if (presence !== 'ok') throw new Error('The room relay could not register the host. Try again.');
+      this.connecting = false;
+      this.setStatus('Room ready. Share the 8-character code with your friends.', 'ok'); this.refresh();
+    } catch (e) { if (this.connecting) this.fail('Could not create the room: ' + (e.message || 'relay error')); }
   },
-  join(code) {
-    if (!this.available()) { this.setStatus('Online play needs the PeerJS library, which failed to load.', 'err'); return; }
+  async join(code) {
+    code = String(code || '').trim().toUpperCase();
+    if (code.length !== 8) { this.setStatus('Enter the full 8-character room code.', 'err'); this.refresh(); return; }
+    if (!this.available()) { this.setStatus('The room relay is not configured. Reload the game and try again.', 'err'); return; }
     this.leave(true);
+    this.clientId = this.makeClientId(); this.clientReady = false; this.code = code;
     this.connecting = true; this.statusText = 'Connecting to room ' + code + '…'; this.refresh();
-    let peer;
-    try { peer = new Peer(undefined, { debug: 0, config: this.iceConfig() }); } catch (e) { this.fail('Could not start networking: ' + e.message); return; }
-    this.peer = peer;
-    const to = setTimeout(() => { if (this.connecting) this.fail('Timed out. Check the code, or try another network.'); }, 15000);
-    peer.on('open', () => {
-      const conn = peer.connect('cs2x-' + code.toLowerCase(), { reliable: true, serialization: 'json' });
-      this.hostConn = conn;
-      conn.on('open', () => {
-        clearTimeout(to); this.role = 'client'; this.connecting = false; this.code = code;
-        conn.send({ t: 'hello', name: Settings.v.name, v: NET_VER, skins: Loadout.v.skins, ks: Loadout.v.knifeSkin, knife: Loadout.v.knife, team: this.myTeam });
-        this.setStatus('Connected. Waiting for the host.', 'ok'); this.refresh();
-      });
-      conn.on('data', d => { try { this.onClient(d); } catch (e) { console.error(e); } });
-      conn.on('close', () => { if (this.role === 'client') this.hostGone(); });
-      conn.on('error', () => { });
-    });
-    peer.on('error', err => { clearTimeout(to); this.fail(err.type === 'peer-unavailable' ? 'Room ' + code + ' was not found.' : 'Connection failed (' + err.type + ').'); });
+    try {
+      this.relay = await this.getRelayClient();
+      if (!this.connecting) return;
+      const channel = await this.openRoomChannel(code, this.clientId);
+      if (!this.connecting) return;
+      this.role = 'client';
+      const presence = await channel.track({ role: 'client', clientId: this.clientId, name: Settings.v.name });
+      if (presence !== 'ok') throw new Error('Could not register in the room. Try again.');
+      this.joinTimer = setTimeout(() => {
+        if (this.connecting) this.fail('No host found for room ' + code + '. Check the code and ask your friend to keep the room open.');
+      }, 12000);
+      this.checkRoomHost();
+      if (!this.clientReady) { this.statusText = 'Waiting for the host in room ' + code + '…'; this.refresh(); }
+    } catch (e) { if (this.connecting) this.fail('Could not join the room: ' + (e.message || 'relay error')); }
   },
   fail(msg) { this.leave(true); this.setStatus(msg, 'err'); this.refresh(); },
   leave(silent) {
-    for (const c of this.conns.values()) { try { c.conn.close(); } catch (e) { } }
+    if (this.joinTimer) { clearTimeout(this.joinTimer); this.joinTimer = null; }
+    const oldChannel = this.channel, oldRole = this.role, oldConn = this.hostConn, oldRelay = this.relay;
+    if (oldRole === 'client' && oldConn && oldConn.open) oldConn.send({ t: 'bye' });
+    this.channel = null;
+    for (const c of this.conns.values()) c.conn.open = false;
     this.conns.clear();
-    if (this.hostConn) { try { this.hostConn.close(); } catch (e) { } this.hostConn = null; }
-    if (this.peer) { try { this.peer.destroy(); } catch (e) { } this.peer = null; }
-    this.role = 'off'; this.connecting = false; this.lobby = null; this.code = ''; this.cGren.clear(); this.cItems.clear();
+    if (this.hostConn) { this.hostConn.open = false; this.hostConn = null; }
+    this.role = 'off'; this.connecting = false; this.clientReady = false; this.clientId = ''; this.lobby = null; this.code = ''; this.cGren.clear(); this.cItems.clear();
+    if (oldChannel && oldRelay) setTimeout(() => { try { oldRelay.removeChannel(oldChannel); } catch (e) { } }, oldRole === 'client' ? 250 : 0);
     if (!silent) { this.setStatus(''); this.refresh(); }
   },
   hostGone() { this.leave(true); if (App.inGame) { App.leaveMatch(true); App.alert('Disconnected', 'The host closed the match or the connection was lost.'); } else { this.setStatus('The host closed the room.', 'err'); this.refresh(); } },
@@ -120,6 +205,7 @@ const Net = {
     if (!c) return;
     const p = App.inGame ? Game.players.find(q => q.id === c.id) : null;
     switch (m.t) {
+      case 'bye': this.dropPeer(conn); break;
       case 'team': { const lp = this.lobby.players.find(x => x.id === c.id); if (lp && ['T', 'CT', 'auto'].includes(m.team)) { lp.team = m.team; this.pushLobby(); this.refresh(); } break; }
       case 'pong': c.ping = Math.round(performance.now() - m.ts); if (p) p.ping = c.ping; break;
       case 'in': if (p && p.alive) this.applyInput(p, m); break;
@@ -246,7 +332,10 @@ const Net = {
   },
   onClient(m) {
     switch (m.t) {
-      case 'welcome': this.myId = m.id; break;
+      case 'welcome':
+        this.myId = m.id; this.code = m.code || this.code;
+        if (this.joinTimer) { clearTimeout(this.joinTimer); this.joinTimer = null; }
+        this.connecting = false; this.setStatus('Connected to room ' + this.code + '.', 'ok'); this.refresh(); break;
       case 'lobby': this.lobby = { players: m.players, cfg: m.cfg }; this.refresh(); break;
       case 'err': this.fail(m.m); break;
       case 'ping': this.send({ t: 'pong', ts: m.ts }); break;

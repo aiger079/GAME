@@ -89,7 +89,7 @@ const Menu = {
     m.innerHTML = `<div class="home${this.enter()}">
       <div class="left">
         <button class="news big" data-go="inventory" style="--thumb:url(${mapThumb('A')})"><span class="tag">ALL FREE</span><h3>Every CS2 weapon</h3><p>All 34 guns from the R8 Revolver to the SCAR-20, six knives and fifteen finishes. Nothing to buy, ever.</p></button>
-        <button class="news" data-go="online"><h3>Play with friends</h3><p>Host a room and share the five-letter code. Peer to peer, no account.</p></button>
+        <button class="news" data-go="online"><h3>Play with friends</h3><p>Host a room and share its 8-character code. Friends join through the room relay.</p></button>
         <button class="news" data-go="help"><h3>How to play</h3><p>Economy, spray control, utility and the bomb, explained in one page.</p></button>
       </div>
       <div></div>
@@ -159,7 +159,7 @@ const Menu = {
     let main = '', go = '';
     if (N.role === 'off' && !N.connecting) {
       main = `<div class="grid2"><div class="card"><h3>Host a match</h3><p>Create a room and share its code. Bots fill the empty slots, and the match runs on your computer.</p><button class="btn prim" id="hostBtn">Create room</button></div>
-        <div class="card"><h3>Join a match</h3><p>Enter the five-letter code your friend sees on their screen.</p><div style="display:flex;gap:10px"><input class="tfield" id="joinCode" maxlength="5" placeholder="CODE" aria-label="Room code" style="text-transform:uppercase;letter-spacing:.24em;font-family:var(--d);font-weight:700;font-size:20px"><button class="btn prim" id="joinBtn">Join</button></div></div></div>`;
+        <div class="card"><h3>Join a match</h3><p>Enter the 8-character code your friend sees on their screen.</p><div style="display:flex;gap:10px"><input class="tfield" id="joinCode" maxlength="8" placeholder="ROOM CODE" aria-label="8-character room code" style="text-transform:uppercase;letter-spacing:.16em;font-family:var(--d);font-weight:700;font-size:20px"><button class="btn prim" id="joinBtn">Join</button></div></div></div>`;
     } else if (N.connecting) {
       main = `<div class="card"><h3>Connecting</h3><p>${esc(N.statusText || 'Connecting…')}</p><button class="btn danger" id="leaveBtn">Cancel</button></div>`;
     } else {
@@ -173,15 +173,15 @@ const Menu = {
     }
     m.innerHTML = `<section class="sheet${this.enter()}">${this.playTabs('online')}
       <div class="body"><div class="main"><div class="field"><label for="nameIn">Your name</label><input class="tfield" id="nameIn" maxlength="16" value="${esc(S.name)}" style="max-width:360px"></div>${main}</div>
-        <aside class="side"><div class="field"><label>How it works</label><p class="note">Everyone opens this same page. One player hosts, the others join with the code. Connections go directly between players over the free PeerJS signaling network, so there is nothing to install and no account.</p></div>
-          <div class="field"><label>Trouble joining?</label><p class="note">Very strict networks, such as some school or mobile carrier connections, block direct links. If joining times out, try a different network.</p></div></aside></div>
+        <aside class="side"><div class="field"><label>How it works</label><p class="note">The host creates a room and shares its 8-character code. Friends who enter that code join the same room. The game relays play data through Supabase, so players do not need a direct connection between their devices.</p></div>
+          <div class="field"><label>Trouble joining?</label><p class="note">Keep the host's room open while friends join. Check the code carefully; if the host closed the room, create a new one and share its new code.</p></div></aside></div>
       <div class="bottom"><div class="sum"><div class="status ${N.statusCls || ''}" id="netStatus">${esc(N.status || '')}</div></div>${go}</div>
     </section>`;
     this.bindPlayTabs(m);
     const nameIn = $('#nameIn'); nameIn.addEventListener('input', () => { S.name = nameIn.value.replace(/[<>]/g, '').slice(0, 16) || 'Player'; Settings.save(); this.renderMe(); });
     const hb = $('#hostBtn'); if (hb) hb.addEventListener('click', () => { SFX.ui('ui_click'); Net.host(); });
     const jc = $('#joinCode'), jb = $('#joinBtn');
-    const join = () => { const c = jc.value.trim().toUpperCase(); if (c.length < 4) { Net.setStatus('Enter the room code', 'err'); return; } SFX.ui('ui_click'); Net.join(c); };
+    const join = () => { const c = jc.value.trim().toUpperCase(); if (c.length !== 8) { Net.setStatus('Enter the full 8-character room code.', 'err'); return; } SFX.ui('ui_click'); Net.join(c); };
     if (jb) jb.addEventListener('click', join);
     if (jc) jc.addEventListener('keydown', e => { if (e.key === 'Enter') join(); });
     const lb = $('#leaveBtn'); if (lb) lb.addEventListener('click', () => { Net.leave(); this.renderPane(); });
